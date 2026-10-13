@@ -113,18 +113,28 @@ export default function App() {
       .filter((item) => item.status === 'idle' || item.status === 'error')
       .map((item) => item.id);
 
+    // 2 gambar diproses bersamaan: pre-processing gambar berikutnya (main thread)
+    // berjalan sambil vtracer gambar sebelumnya bekerja di Web Worker.
+    const CONCURRENCY = 2;
     let fallbackCount = 0;
-    for (const id of pendingIds) {
-      const result = await processItem(id);
-      if (result?.usedFallback) fallbackCount++;
-    }
+    let cursor = 0;
+    const runLane = async () => {
+      while (cursor < pendingIds.length) {
+        const id = pendingIds[cursor++];
+        const result = await processItem(id);
+        if (result?.usedFallback) fallbackCount++;
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, pendingIds.length) }, () => runLane())
+    );
 
     setIsProcessingBatch(false);
     isBatchRunning.current = false;
 
     if (fallbackCount > 0) {
       showToast(
-        `${fallbackCount} dari ${pendingIds.length} gambar jatuh ke ImageTracer (server gagal). Cek badge merah & proses ulang sebelum submit.`,
+        `${fallbackCount} dari ${pendingIds.length} gambar jatuh ke ImageTracer (vtracer gagal). Cek badge merah & proses ulang sebelum submit.`,
         'error'
       );
     } else if (pendingIds.length > 0) {

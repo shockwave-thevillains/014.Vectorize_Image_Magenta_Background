@@ -91,7 +91,7 @@ export interface VectorResult {
   mergedColorCount?: number;
   actualUpscaleFactor?: number;
   warnings?: string[];
-  /** true bila server vtracer gagal dan gambar diproses ImageTracer (fallback) */
+  /** true bila vtracer gagal dan gambar diproses ImageTracer (fallback) */
   usedFallback?: boolean;
   qualityScore: 'optimal' | 'good' | 'warning';
   qualityMessage?: string;
