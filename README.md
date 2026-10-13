@@ -31,6 +31,32 @@ https://<username>.github.io/<nama-repo>/
 
 Build memakai path relatif (`base: './'`), jadi tidak perlu mengubah konfigurasi bila nama repo/username berubah.
 
+### 1b. Hosting di repo akun GitHub lain (kode tetap di repo ini)
+
+Workflow yang sama bisa mengirim hasil build ke repo milik akun lain, sehingga situs tampil di
+`https://<akun-lain>.github.io/...` sementara kode sumber tetap di sini. Tanpa konfigurasi di bawah,
+workflow men-deploy ke Pages repo ini sendiri (perilaku default).
+
+1. **Di akun lain:** buat repo **public** kosong, mis. `vectorizer`
+   (atau `<akun-lain>.github.io` bila ingin alamat tanpa sub-path).
+2. **Di komputer sendiri:** buat sepasang deploy key (tanpa passphrase):
+   ```bash
+   ssh-keygen -t ed25519 -C "deploy-014" -f deploy_014 -N ""
+   ```
+   Hasilnya `deploy_014` (private) dan `deploy_014.pub` (public).
+3. **Repo tujuan (akun lain)** → Settings → **Deploy keys** → *Add deploy key* → tempel isi
+   `deploy_014.pub` → centang **Allow write access** → Add.
+4. **Repo ini (014)** → Settings → **Secrets and variables → Actions**:
+   - tab **Secrets** → *New repository secret* → nama `PAGES_DEPLOY_KEY`, isi seluruh `deploy_014`
+     (termasuk baris `-----BEGIN…` dan `-----END…`).
+   - tab **Variables** → *New repository variable* → nama `PAGES_REPO`, isi `<akun-lain>/<nama-repo>`.
+   - (opsional) variable `PAGES_BRANCH` bila tidak ingin memakai branch default `gh-pages`.
+5. **Repo ini (014)** → Actions → **Deploy to GitHub Pages** → *Run workflow*. Branch `gh-pages`
+   otomatis terbentuk di repo tujuan.
+6. **Repo tujuan** → Settings → **Pages** → Source: **Deploy from a branch** → `gh-pages` / `/ (root)` → Save.
+7. Hapus file `deploy_014` dari komputer setelah tersimpan di secret.
+8. (Opsional) Matikan Pages lama di repo ini: Settings → Pages → *Unpublish site*.
+
 ## 2. Menjalankan di komputer sendiri
 
 ### Opsi A — Docker
