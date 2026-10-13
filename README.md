@@ -1,70 +1,104 @@
 # 014 · Vectorize Image — Magenta Background
 
-Batch converter gambar raster ke vektor multi-warna (**SVG + EPS**) untuk microstock. Gambar dengan
-background magenta `#FF00FF` (atau putih) otomatis dibuat transparan. Output diskalakan ke ≥ 15 MP.
+Batch converter gambar raster ke vektor multi-warna (**SVG + EPS**) untuk microstock. Background magenta
+`#FF00FF` (atau putih) otomatis dibuat transparan. Output diskalakan ke ≥ 15 MP.
 
-Mesin utama: [`@visioncortex/vtracer`](https://www.npmjs.com/package/@visioncortex/vtracer) (Rust → WebAssembly)
-yang berjalan di server Node.js (`server.ts`). Frontend: React + Vite.
+**Berjalan 100% di browser.** Tidak ada server, tidak ada upload: gambar tidak pernah meninggalkan
+komputer pengguna. Karena itu aplikasi ini bisa di-hosting gratis sebagai situs statis di **GitHub Pages**.
 
-> Aplikasi ini **tidak memanggil Gemini / API eksternal apa pun**. `GEMINI_API_KEY` di `.env.example`
-> hanya sisa template Google AI Studio dan tidak dibutuhkan.
+- Mesin vektor: [`@visioncortex/vtracer`](https://github.com/visioncortex/vtracer) (Rust → WebAssembly),
+  dijalankan di **Web Worker** supaya UI tetap responsif.
+- Frontend: React + Vite + Tailwind.
+- Tidak memanggil API eksternal apa pun (tidak ada Gemini, analytics, atau CDN).
 
 ---
 
-## Cara menjalankan
+## 1. Hosting di GitHub Pages
 
-### Opsi A — Docker (disarankan)
+Workflow `.github/workflows/deploy-pages.yml` otomatis build & deploy setiap ada push ke `main`.
 
-Syarat: Docker Desktop terpasang & running.
+**Sekali saja**, aktifkan Pages di repo:
+
+1. Buka **Settings → Pages**.
+2. Di **Build and deployment → Source**, pilih **GitHub Actions**.
+3. Buka tab **Actions** → workflow **Deploy to GitHub Pages** → **Run workflow** (atau push apa saja ke `main`).
+
+Setelah workflow hijau, situs tersedia di:
+
+```
+https://<username>.github.io/<nama-repo>/
+```
+
+Build memakai path relatif (`base: './'`), jadi tidak perlu mengubah konfigurasi bila nama repo/username berubah.
+
+## 2. Menjalankan di komputer sendiri
+
+### Opsi A — Docker
 
 ```bash
 docker compose up -d --build
 ```
 
-Buka **http://localhost:3000**.
+Buka **http://localhost:3000**. Hentikan dengan `docker compose down`.
+(Image berisi nginx yang menyajikan file statis; tidak ada Node.js di runtime.)
 
-| Perintah | Fungsi |
-|---|---|
-| `docker compose up -d` | Menyalakan lagi (tanpa build ulang) |
-| `docker compose down` | Menghentikan |
-| `docker logs vectorize-studio` | Melihat log bila ada error |
-
-Setelah build pertama, aplikasi berjalan sepenuhnya offline di mesin sendiri.
-
-### Opsi B — Node.js langsung
-
-Syarat: Node.js LTS.
+### Opsi B — Node.js
 
 ```bash
-npm install --legacy-peer-deps
-npm run dev
+npm install
+npm run dev        # mode pengembangan  → http://localhost:3000
+# atau
+npm run build && npm run preview   # versi produksi → http://localhost:3000
 ```
-
-Buka **http://localhost:3000**.
-
-> `--legacy-peer-deps` **wajib** — tanpa itu `npm install` gagal dengan `ERESOLVE`
-> (konflik peer dependency esbuild/vite).
 
 ---
 
-## Kenapa sebaiknya dijalankan lokal, bukan di preview AI Studio
+## Arsitektur singkat
 
-Setiap gambar dikirim dari browser ke server vtracer. Di preview AI Studio, server itu ada di
-infrastruktur Google, sehingga setiap gambar menyeberang internet. Dijalankan lokal, "upload" hanya dari
-browser ke mesin yang sama → praktis instan.
+```
+Browser (main thread)                       Web Worker
+─────────────────────                       ──────────
+load gambar → upscale (opsional)
+→ color snapping → hapus background
+→ kirim piksel RGBA (transfer, zero-copy) ──▶ vtracer WASM → SVG mentah
+◀────────────────────────────────────────────
+bake transform → buang path background
+→ skala ke ≥15 MP → buat EPS → ZIP
+```
 
-## Perubahan dari versi awal (AI Studio)
+- Pool berisi 1–3 worker (mengikuti jumlah core CPU); batch memproses **2 gambar bersamaan**, sehingga
+  pre-processing gambar berikutnya berjalan sambil vtracer bekerja.
+- Bila vtracer gagal (mis. browser sangat lama tanpa WebAssembly), gambar diproses dengan ImageTracer
+  sebagai cadangan dan diberi **badge merah "Fallback ImageTracer — proses ulang"** serta toast di akhir batch.
 
-| Perubahan | Dampak |
-|---|---|
-| Browser mengirim **PNG terkompresi**, bukan piksel RGBA mentah ber-base64 | Payload per gambar turun dari ~30 MB menjadi ~200 KB. Output SVG identik (sudah diverifikasi byte-per-byte). |
-| Fallback ke ImageTracer **tidak lagi diam-diam** | Bila server vtracer gagal, item diberi badge merah *"Fallback ImageTracer — proses ulang"* dan muncul toast di akhir batch. |
-| Server tidak lagi membuat EPS | EPS selalu dibuat ulang di klien setelah SVG diskalakan; versi server dulu dikirim lalu dibuang. |
-| `Dockerfile`, `docker-compose.yml`, `.dockerignore` | Menjalankan tanpa perlu memasang Node.js. |
+### Tentang `src/vendor/vtracer/`
+
+Paket npm `@visioncortex/vtracer` dibuat untuk Node.js (memuat `.wasm` lewat `fs`). Skrip
+`scripts/vendor-vtracer.mjs` mengganti **hanya** pemuat itu dengan pemuat `fetch` untuk browser; file
+`.wasm`-nya sama persis. Hasilnya byte-for-byte sama dengan versi Node (sudah diverifikasi).
+
+Setelah meng-upgrade `@visioncortex/vtracer`, jalankan ulang:
+
+```bash
+npm run vendor:vtracer
+```
+
+---
 
 ## Catatan pemakaian
 
-- **Upscale** (pilihan `1x / 2x / 4x` di UI): default 4x memperbesar gambar 1024 px ke 2400 px sebelum
-  tracing — lebih halus di tepi, tapi ~4–6× lebih berat. Uji A/B di zoom 200% sebelum memilih.
+- **Upscale** (`1x / 2x / 4x` di UI): default 4x memperbesar gambar 1024 px ke 2400 px sebelum tracing —
+  tepi lebih halus, tapi ~4–6× lebih berat. Uji A/B di zoom 200% sebelum memilih.
 - **Badge merah "Fallback ImageTracer"** = gambar itu tidak diproses vtracer. Proses ulang sebelum submit.
 - Biarkan tab browser tetap di depan selama batch berjalan (Chrome memperlambat tab latar belakang).
+- Semua pemrosesan memakai CPU & RAM komputer pengguna. Batch besar (100+ gambar) di laptop lama bisa
+  terasa berat; proses bertahap bila perlu.
+
+## Riwayat perubahan dari versi AI Studio
+
+| Perubahan | Dampak |
+|---|---|
+| vtracer dipindah dari server Express ke Web Worker di browser | Bisa di-hosting statis (GitHub Pages); tanpa upload sama sekali. |
+| Batch 2 gambar bersamaan + pool worker | ~2,3× lebih cepat dibanding versi server pada uji 31 gambar (1,1 s vs 2,5 s per gambar). |
+| Fallback ke ImageTracer ditandai jelas | Tidak ada lagi batch campuran vtracer/ImageTracer yang tak terdeteksi. |
+| Dependensi server (express, tsx, dotenv, @google/genai) & `esbuild` usang dihapus | `npm install` biasa langsung berhasil (sebelumnya gagal `ERESOLVE`). |

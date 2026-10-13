@@ -1,19 +1,13 @@
-# Vectorize Multi-Color Studio — jalan 100% lokal, tanpa server Google.
-FROM node:22-slim
-
+# Vectorize Image — Magenta Background (versi statis, 100% di browser)
+# Tahap 1: build frontend → /app/dist
+FROM node:22-slim AS build
 WORKDIR /app
-
-# Install dependensi dulu (layer di-cache selama package.json tidak berubah).
-# --legacy-peer-deps wajib: tanpa itu npm gagal dengan ERESOLVE (konflik peer esbuild/vite).
-COPY package.json ./
-RUN npm install --legacy-peer-deps --no-audit --no-fund
-
-# Salin source lalu build frontend ke /app/dist
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY . .
-RUN npx vite build
+RUN npm run build
 
-# Mode production: server.ts menyajikan /app/dist + endpoint /api/vectorize
-ENV NODE_ENV=production
-EXPOSE 3000
-
-CMD ["npx", "tsx", "server.ts"]
+# Tahap 2: sajikan file statis dengan nginx (tanpa Node.js di runtime)
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80

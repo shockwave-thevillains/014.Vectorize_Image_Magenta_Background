@@ -4,5 +4,5 @@ services:
     image: vectorize-studio
     container_name: vectorize-studio
     ports:
-      - "3000:3000"
+      - "3000:80"
     restart: unless-stopped

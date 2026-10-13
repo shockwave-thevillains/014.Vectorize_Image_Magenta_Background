@@ -16,6 +16,8 @@ import {
 import { bicubicUpscale } from './resampler';
 import { bakeTransformsWithSvgPath } from './svgTransformBaker';
 import { calculateTargetDimensions, scaleSvg } from './svgRescaler';
+import { buildVtracerOptions } from './vtracerOptions';
+import { vectorizeRgbaInWorker } from './vtracerClient';
 
 function getImageTracer() {
   if (typeof window !== 'undefined' && (window as any).ImageTracer) {
@@ -860,71 +862,81 @@ function sleep(ms = 0): Promise<void> {
 }
 
 /**
- * Server-side high quality vectorization with @visioncortex/vtracer (WASM)
+ * Post-processing that used to run in the Express endpoint (server.ts),
+ * moved 1:1 to the browser: bake transforms, drop background-colored paths,
+ * and normalize the root <svg> attributes.
  */
-async function vectorizeWithServer(
+function postProcessVtracerSvg(rawSvg: string, w: number, h: number, config: VectorizeConfig): string {
+  if (!rawSvg || !rawSvg.includes('<svg')) {
+    throw new Error('Gagal menghasilkan kurva vektor SVG dari gambar.');
+  }
+
+  let svg = bakeTransformsWithSvgPath(rawSvg);
+
+  const isMagentaMode = (config.bgMode ?? 'magenta') === 'magenta';
+  const isWhiteMode = config.bgMode === 'white';
+  const isBgRemoval = config.removeBackground !== false;
+
+  if (isMagentaMode && isBgRemoval) {
+    svg = filterMagentaPathsInSvg(svg, config.magentaTolerance ?? 14);
+  } else if (isWhiteMode && config.keepInnerWhite === false) {
+    svg = filterWhitePathsInSvg(svg, config.whiteTolerance ?? 242);
+  }
+
+  if (!svg.includes('viewBox')) {
+    svg = svg.replace('<svg ', `<svg viewBox="0 0 ${w} ${h}" `);
+  }
+  if (!svg.includes('preserveAspectRatio')) {
+    svg = svg.replace('<svg ', '<svg preserveAspectRatio="xMidYMid meet" ');
+  }
+
+  svg = svg.replace(/<svg\s+([^>]+)>/i, (match) => {
+    let clean = match;
+    clean = clean.replace(/\bwidth=["'][^"']+["']/gi, 'width="100%"');
+    clean = clean.replace(/\bheight=["'][^"']+["']/gi, 'height="100%"');
+    if (!clean.includes('width=')) clean = clean.replace('<svg', '<svg width="100%"');
+    if (!clean.includes('height=')) clean = clean.replace('<svg', '<svg height="100%"');
+    return clean;
+  });
+
+  return svg;
+}
+
+/**
+ * High quality vectorization with @visioncortex/vtracer (Rust → WebAssembly),
+ * running entirely in the browser inside a Web Worker. No server, no upload.
+ */
+async function vectorizeWithVtracer(
   imageSrc: string,
   config: VectorizeConfig,
   fileName = 'vector_output',
   onProgress?: (pct: number) => void
 ): Promise<VectorResult> {
+  const startTime = performance.now();
   onProgress?.(15);
   await sleep(10);
 
-  const { canvas, width, height, rawColorCount, mergedColorCount, effectiveScale, snappedPalette } = await loadImageToCanvas(imageSrc, config);
-  onProgress?.(35);
-  await sleep(10);
+  const { width, height, imageData, rawColorCount, mergedColorCount, effectiveScale, snappedPalette } = await loadImageToCanvas(imageSrc, config);
+  onProgress?.(40);
 
-  // PERF: kirim PNG terkompresi, BUKAN piksel RGBA mentah.
-  // Setelah color snapping gambar hanya berisi blok warna datar, jadi PNG-nya
-  // ~puluhan–ratusan KB vs ~30 MB untuk RGBA mentah ber-base64 (2400x2400).
-  // Hasil vtracer identik (convertBuffer men-decode PNG ke RGBA yang sama).
-  const pngBlob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error('Gagal meng-encode PNG'))),
-      'image/png'
-    );
-  });
-  const imageBase64 = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(new Error('Gagal mengonversi PNG ke base64'));
-    reader.readAsDataURL(pngBlob);
-  });
-
-  onProgress?.(50);
-
-  const res = await fetch('/api/vectorize', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      imageBase64,
-      width,
-      height,
-      config: {
-        ...config,
-        rawColorCount,
-        mergedColorCount,
-        snappedPalette,
-        actualUpscaleFactor: effectiveScale,
-      },
-      fileName,
-    }),
-  });
-
+  const vtracerOptions = buildVtracerOptions({ ...config, mergedColorCount, snappedPalette });
+  // Buffer piksel dipindahkan (zero-copy) ke worker; imageData tidak dipakai lagi setelah ini.
+  const { svg: rawSvg } = await vectorizeRgbaInWorker(imageData.data, width, height, vtracerOptions);
   onProgress?.(80);
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Server vectorizer failed (${res.status}): ${errText}`);
-  }
-
-  const data = await res.json();
-  if (!data.success) {
-    throw new Error(data.error || 'Server vectorizer returned error');
-  }
+  const data = {
+    svgString: postProcessVtracerSvg(rawSvg, width || 600, height || 600, config),
+    width: width || 600,
+    height: height || 600,
+    processingTimeMs: 0,
+    engineUsed: '@visioncortex/vtracer (Rust/WASM, browser worker)',
+    engineVersion: 'v1.0.0-alpha.4',
+    activeMode: config.curveStyle || config.mode || 'polygon',
+    rawColorCount,
+    mergedColorCount,
+    actualUpscaleFactor: effectiveScale,
+    warnings: [] as string[],
+  };
 
   let finalSvg = bakeTransformsWithSvgPath(data.svgString);
 
@@ -999,7 +1011,7 @@ async function vectorizeWithServer(
     palette,
     svgSize: svgBytes,
     epsSize: epsBytes,
-    processingTimeMs: data.processingTimeMs || 0,
+    processingTimeMs: Math.round(performance.now() - startTime),
     engineUsed: data.engineUsed || '@visioncortex/vtracer (Rust/WASM)',
     engineVersion: data.engineVersion || 'v1.0.0-alpha.4',
     activeMode: data.activeMode || config.curveStyle || config.mode || 'polygon',
@@ -1176,17 +1188,17 @@ export async function vectorizeImage(
   }
 
   try {
-    return await vectorizeWithServer(imageSrc, config, fileName, onProgress);
-  } catch (serverErr: any) {
-    // Fallback TIDAK lagi diam-diam: hasil ditandai supaya batch campuran
+    return await vectorizeWithVtracer(imageSrc, config, fileName, onProgress);
+  } catch (vtracerErr: any) {
+    // Fallback TIDAK diam-diam: hasil ditandai supaya batch campuran
     // vtracer + ImageTracer (kualitas berbeda) terlihat di antrean.
-    console.warn('Server vectorizer error, falling back to client engine:', serverErr);
+    console.warn('vtracer error, falling back to ImageTracer:', vtracerErr);
     const result = await vectorizeWithClient(imageSrc, config, fileName, onProgress);
     return {
       ...result,
       usedFallback: true,
       warnings: [
-        `Server vtracer gagal (${serverErr?.message || 'unknown error'}). Gambar ini diproses dengan ImageTracer (kualitas berbeda) — proses ulang sebelum submit.`,
+        `vtracer gagal (${vtracerErr?.message || 'unknown error'}). Gambar ini diproses dengan ImageTracer (kualitas berbeda) — proses ulang sebelum submit.`,
         ...(result.warnings || []),
       ],
     };
